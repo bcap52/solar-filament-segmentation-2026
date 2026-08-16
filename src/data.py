@@ -1,14 +1,17 @@
 """Data loading for the MAGFiLO Kaggle-2026 train annotations.
 
 Key structure of the COCO-ish JSON:
-- images: 1154 entries, id = "<annotator_set_id>-<jpeg_stem>" -> 707 physical
-  JPEGs; 296 JPEGs have MULTIPLE annotator sets.
+- images: 1154 entries, id = "<annotator_set_id>-<jpeg_stem>" (e.g. "040301-20140609195854Bh")
+  -> 707 physical JPEGs; 296 JPEGs have MULTIPLE annotator sets.
 - annotations: 8199, each with polygon `segmentation`, `spine`, `area`, `bbox`,
   `image_id` (annotator-image key), `category_id` (1..4 chirality).
+
+DATA_ROOT overridable via FILAMENT_DATA_ROOT env var (e.g. on Kaggle).
 """
 from __future__ import annotations
 
 import json
+import os
 from collections import defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -17,7 +20,8 @@ import numpy as np
 
 from .rle import polygons_to_mask
 
-DATA_ROOT = Path(__file__).resolve().parents[1] / "data_extract" / "MAGFiLO_1.0_Kaggle_2026"
+_DEFAULT_ROOT = Path(__file__).resolve().parents[1] / "data_extract" / "MAGFiLO_1.0_Kaggle_2026"
+DATA_ROOT = Path(os.environ.get("FILAMENT_DATA_ROOT", str(_DEFAULT_ROOT)))
 TRAIN_JSON = DATA_ROOT / "train" / "MAGFiLO_1.0_Annotations_kaggle2026_train.json"
 TRAIN_IMG_DIR = DATA_ROOT / "train" / "train_images"
 TEST_IMG_DIR = DATA_ROOT / "test" / "test_images"
