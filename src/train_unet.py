@@ -6,9 +6,11 @@ union of that annotator set's instances (pre-rasterized RLE cache). GroupKFold(5
 by physical JPEG stem (leakage-safe). SMP UNet + ResNet34 (ImageNet pretrain),
 BCE + soft Dice, AMP fp16, cosine LR. Device: xpu (Intel Arc) > cuda > cpu.
 
-Images load through a memory-mapped uint8 stack (runs/images_u8.npy, see
-src/build_image_stack.py) — keeps the resident set small and avoids Windows
-paging-file failures. Caches are built automatically if missing.
+Dataloading is GPU-first: crops read from a pre-normalized f16 memmap
+(runs/images_f16.npy via src/build_f16_stack.py), masks decode from the RLE
+cache, crops happen BEFORE augmentation, and 2 persistent DataLoader workers
+overlap CPU prep with GPU compute (Windows spawn-safe via lazy memmap open).
+Caches build automatically if missing.
 
 XPU note: tiled inference (predict_full) accumulates in numpy on CPU —
 torch 2.13.0+xpu's in-place slice-add path was observed returning corrupt
@@ -72,33 +74,43 @@ def ensure_caches():
 
 
 class FilamentCropDataset(Dataset):
-    """One sample = (annotator-image, random native-res crop)."""
+    """One sample = (annotator-image, random native-res crop).
 
-    def __init__(self, ann_images: list, img_cache: dict, crop: int = CROP,
+    Reads pre-normalized f16 crops from a memmap (lazy-opened per worker so
+    DataLoader workers pickle cleanly on Windows spawn). Masks decode from the
+    RLE cache, then everything crops BEFORE augment — minimal CPU per sample.
+    """
+
+    def __init__(self, ann_images: list, row_of: dict, crop: int = CROP,
                  train: bool = True, gt_sem_rle: dict | None = None,
-                 img_stack=None):
+                 stack_path: Path | None = None):
         self.items = ann_images
-        self.img_cache = img_cache
+        self.row_of = row_of                # {stem: row}
         self.crop = crop
         self.train = train
         self.gt_sem_rle = gt_sem_rle
-        self.img_stack = img_stack
+        self.stack_path = stack_path
+        self._stack = None                  # lazy per-process memmap
 
     def __len__(self):
         return len(self.items)
 
+    def __getstate__(self):
+        s = self.__dict__.copy()
+        s["_stack"] = None                  # never pickle the memmap
+        return s
+
     def __getitem__(self, idx):
         from src.rle import rle_to_mask
         ai = self.items[idx]
-        row, p1, p99 = self.img_cache[ai.stem]
-        raw = np.asarray(self.img_stack[row])
-        img = np.clip((raw.astype(np.float32) - p1) / (p99 - p1), 0, 1)
+        if self._stack is None:
+            self._stack = np.load(self.stack_path, mmap_mode="r")
         if self.gt_sem_rle is not None:
-            mask = rle_to_mask(self.gt_sem_rle[ai.image_key]).astype(np.float32)
+            mask = rle_to_mask(self.gt_sem_rle[ai.image_key])
         else:
-            mask = np.zeros((2048, 2048), np.float32)
+            mask = np.zeros((2048, 2048), np.uint8)
             for inst in ai.instances:
-                mask[inst.mask() > 0] = 1.0
+                mask[inst.mask() > 0] = 1
 
         c = self.crop
         if self.train:
@@ -111,8 +123,9 @@ class FilamentCropDataset(Dataset):
                 cx = random.randint(0, 2048 - c)
         else:
             cy = cx = (2048 - c) // 2
-        x = img[cy:cy + c, cx:cx + c].copy()
-        y = mask[cy:cy + c, cx:cx + c].copy()
+        x = np.asarray(self._stack[self.row_of[ai.stem], cy:cy + c, cx:cx + c],
+                       dtype=np.float32)
+        y = mask[cy:cy + c, cx:cx + c].astype(np.float32)
 
         if self.train:
             if random.random() < 0.5:
@@ -163,11 +176,15 @@ def predict_full(model, img: np.ndarray, device, crop: int = CROP) -> np.ndarray
 
 
 def instances_from_prob(prob: np.ndarray, thr: float, min_area: int = MIN_AREA) -> list[np.ndarray]:
-    cand = (prob > thr).astype(np.uint8)
+    cand = (prob > thr).astype(np_uint8())
     cand = cv2.morphologyEx(cand, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
     n, lab = cv2.connectedComponents(cand, connectivity=8)
     return [(lab == i).astype(np.uint8) for i in range(1, n)
             if (lab == i).sum() >= min_area]
+
+
+def np_uint8():
+    return np.uint8
 
 
 def main(fold: int = VAL_FOLD, epochs: int = EPOCHS, tag: str = "unet_r34_v1"):
@@ -178,9 +195,11 @@ def main(fold: int = VAL_FOLD, epochs: int = EPOCHS, tag: str = "unet_r34_v1"):
     run_dir.mkdir(parents=True, exist_ok=True)
 
     ensure_caches()
-    from src.build_image_stack import load_stack
-    img_stack, img_cache = load_stack()
-    print(f"image stack: {img_stack.shape} memmap")
+    f16 = CKPT_DIR / "images_f16.npy"
+    if not f16.exists():
+        subprocess.check_call([sys.executable, "-u", str(ROOT / "src" / "build_f16_stack.py")])
+    row_of = {s: i for i, s in enumerate(train_stems())}
+    print(f"f16 normalized stack: {f16.name} ({len(row_of)} stems)")
 
     by_key = load_annotations()
     folds = make_folds(train_stems())
@@ -204,11 +223,12 @@ def main(fold: int = VAL_FOLD, epochs: int = EPOCHS, tag: str = "unet_r34_v1"):
         if k.startswith("sem::"):
             gt_sem[k[5:]] = str(z[k])
     print(f"GT semantic RLE cache: {len(gt_sem)} sets")
-    train_ds = FilamentCropDataset(train_items, img_cache, gt_sem_rle=gt_sem,
-                                   img_stack=img_stack)
-    val_ds = FilamentCropDataset(val_items, img_cache, train=False, gt_sem_rle=gt_sem,
-                                 img_stack=img_stack)
-    train_dl = DataLoader(train_ds, batch_size=BATCH, shuffle=True, num_workers=0, drop_last=True)
+    train_ds = FilamentCropDataset(train_items, row_of, gt_sem_rle=gt_sem,
+                                   stack_path=f16)
+    val_ds = FilamentCropDataset(val_items, row_of, train_of=row_of, train=False,
+                                 gt_sem_rle=gt_sem, stack_path=f16)
+    train_dl = DataLoader(train_ds, batch_size=BATCH, shuffle=True, drop_last=True,
+                          num_workers=2, persistent_workers=True, prefetch_factor=4)
     val_dl = DataLoader(val_ds, batch_size=BATCH, shuffle=False, num_workers=0)
 
     best_val = 1e9
