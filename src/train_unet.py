@@ -1,19 +1,25 @@
 """U-Net semantic segmentation training for filament PQ.
 
-Samples = annotator-image sets (1154). Each epoch draws ONE random native-res
-1024x1024 crop per sample (70% foreground-biased). Target = semantic union of
-that annotator set's instances (pre-rasterized RLE cache). GroupKFold(5) by
-physical JPEG stem. SMP UNet + ResNet34 (ImageNet). BCE + soft Dice, AMP,
-cosine LR. Device: xpu > cuda > cpu.
+Samples = annotator-image sets (1154 over 707 JPEGs). Each epoch draws ONE random
+native-res 1024x1024 crop per sample (70% foreground-biased). Target = semantic
+union of that annotator set's instances (pre-rasterized RLE cache). GroupKFold(5)
+by physical JPEG stem (leakage-safe). SMP UNet + ResNet34 (ImageNet pretrain),
+BCE + soft Dice, AMP fp16, cosine LR. Device: xpu (Intel Arc) > cuda > cpu.
 
-NOTE (XPU): tiled inference accumulates in numpy on CPU — torch 2.13.0+xpu's
-in-place slice-add path was observed returning corrupt values.
+Images load through a memory-mapped uint8 stack (runs/images_u8.npy, see
+src/build_image_stack.py) — keeps the resident set small and avoids Windows
+paging-file failures. Caches are built automatically if missing.
+
+XPU note: tiled inference (predict_full) accumulates in numpy on CPU —
+torch 2.13.0+xpu's in-place slice-add path was observed returning corrupt
+values (see PROJECT_LOG).
 """
 from __future__ import annotations
 
 import json
 import math
 import random
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -58,16 +64,25 @@ def make_folds(stems: list[str], n_folds: int = 5, seed: int = SEED) -> dict[str
     return {s: i % n_folds for i, s in enumerate(stems)}
 
 
+def ensure_caches():
+    if not (CKPT_DIR / "gt_semantic_rle.npz").exists():
+        subprocess.check_call([sys.executable, "-u", str(ROOT / "src" / "build_gt_cache.py")])
+    if not ((CKPT_DIR / "images_u8.npy").exists() and (CKPT_DIR / "image_stats.json").exists()):
+        subprocess.check_call([sys.executable, "-u", str(ROOT / "src" / "build_image_stack.py")])
+
+
 class FilamentCropDataset(Dataset):
     """One sample = (annotator-image, random native-res crop)."""
 
     def __init__(self, ann_images: list, img_cache: dict, crop: int = CROP,
-                 train: bool = True, gt_sem_rle: dict | None = None):
+                 train: bool = True, gt_sem_rle: dict | None = None,
+                 img_stack=None):
         self.items = ann_images
         self.img_cache = img_cache
         self.crop = crop
         self.train = train
         self.gt_sem_rle = gt_sem_rle
+        self.img_stack = img_stack
 
     def __len__(self):
         return len(self.items)
@@ -75,7 +90,8 @@ class FilamentCropDataset(Dataset):
     def __getitem__(self, idx):
         from src.rle import rle_to_mask
         ai = self.items[idx]
-        raw, p1, p99 = self.img_cache[ai.stem]
+        row, p1, p99 = self.img_cache[ai.stem]
+        raw = np.asarray(self.img_stack[row])
         img = np.clip((raw.astype(np.float32) - p1) / (p99 - p1), 0, 1)
         if self.gt_sem_rle is not None:
             mask = rle_to_mask(self.gt_sem_rle[ai.image_key]).astype(np.float32)
@@ -161,20 +177,18 @@ def main(fold: int = VAL_FOLD, epochs: int = EPOCHS, tag: str = "unet_r34_v1"):
     run_dir = CKPT_DIR / f"{tag}_fold{fold}"
     run_dir.mkdir(parents=True, exist_ok=True)
 
+    ensure_caches()
+    from src.build_image_stack import load_stack
+    img_stack, img_cache = load_stack()
+    print(f"image stack: {img_stack.shape} memmap")
+
     by_key = load_annotations()
     folds = make_folds(train_stems())
     json.dump(folds, open(run_dir / "folds.json", "w"), indent=1)
 
     train_items = [ai for ai in by_key.values() if folds[ai.stem] != fold]
     val_items = [ai for ai in by_key.values() if folds[ai.stem] == fold]
-    print(f"train ann-images: {len(train_items)}")
-
-    print("caching images (train+val) as uint8 + percentile stats...")
-    img_cache = {}
-    for stem in sorted({ai.stem for ai in by_key.values()}):
-        img = cv2.imread(str(TRAIN_IMG_DIR / f"{stem}.jpeg"), cv2.IMREAD_GRAYSCALE)
-        p1, p99 = np.percentile(img, 1), np.percentile(img, 99)
-        img_cache[stem] = (img, float(p1), float(max(p99, p1 + 1)))
+    print(f"train ann-images: {len(train_items)} | val ann-sets: {len(val_items)}")
 
     model = build_model().to(device)
     opt = torch.optim.AdamW(model.parameters(), lr=LR, weight_decay=1e-4)
@@ -185,15 +199,15 @@ def main(fold: int = VAL_FOLD, epochs: int = EPOCHS, tag: str = "unet_r34_v1"):
            if device.type != "cpu" else torch.autocast("cpu", enabled=False))
 
     gt_sem = {}
-    gt_npz = ROOT / "runs" / "gt_semantic_rle.npz"
-    if gt_npz.exists():
-        z = np.load(gt_npz, allow_pickle=True)
-        for k in z.files:
-            if k.startswith("sem::"):
-                gt_sem[k[5:]] = str(z[k])
-        print(f"GT semantic RLE cache: {len(gt_sem)} sets")
-    train_ds = FilamentCropDataset(train_items, img_cache, gt_sem_rle=gt_sem)
-    val_ds = FilamentCropDataset(val_items, img_cache, train=False, gt_sem_rle=gt_sem)
+    z = np.load(CKPT_DIR / "gt_semantic_rle.npz", allow_pickle=True)
+    for k in z.files:
+        if k.startswith("sem::"):
+            gt_sem[k[5:]] = str(z[k])
+    print(f"GT semantic RLE cache: {len(gt_sem)} sets")
+    train_ds = FilamentCropDataset(train_items, img_cache, gt_sem_rle=gt_sem,
+                                   img_stack=img_stack)
+    val_ds = FilamentCropDataset(val_items, img_cache, train=False, gt_sem_rle=gt_sem,
+                                 img_stack=img_stack)
     train_dl = DataLoader(train_ds, batch_size=BATCH, shuffle=True, num_workers=0, drop_last=True)
     val_dl = DataLoader(val_ds, batch_size=BATCH, shuffle=False, num_workers=0)
 
