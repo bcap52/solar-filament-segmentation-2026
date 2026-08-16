@@ -22,6 +22,7 @@ STATS = ROOT / "runs" / "image_stats.json"
 
 
 def main():
+    STACK.parent.mkdir(parents=True, exist_ok=True)
     if STACK.exists() and STATS.exists():
         print("mmap stack already exists")
         return

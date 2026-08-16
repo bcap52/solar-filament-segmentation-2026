@@ -16,6 +16,7 @@ from src.rle import mask_to_rle  # noqa: E402
 
 
 def main(out: Path = Path("runs/gt_semantic_rle.npz")):
+    out.parent.mkdir(parents=True, exist_ok=True)
     by_key = load_annotations()
     sem: dict[str, str] = {}
     inst: dict[str, str] = {}
