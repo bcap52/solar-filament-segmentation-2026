@@ -176,15 +176,11 @@ def predict_full(model, img: np.ndarray, device, crop: int = CROP) -> np.ndarray
 
 
 def instances_from_prob(prob: np.ndarray, thr: float, min_area: int = MIN_AREA) -> list[np.ndarray]:
-    cand = (prob > thr).astype(np_uint8())
+    cand = (prob > thr).astype(np.uint8)
     cand = cv2.morphologyEx(cand, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
     n, lab = cv2.connectedComponents(cand, connectivity=8)
     return [(lab == i).astype(np.uint8) for i in range(1, n)
             if (lab == i).sum() >= min_area]
-
-
-def np_uint8():
-    return np.uint8
 
 
 def main(fold: int = VAL_FOLD, epochs: int = EPOCHS, tag: str = "unet_r34_v1"):
@@ -198,7 +194,8 @@ def main(fold: int = VAL_FOLD, epochs: int = EPOCHS, tag: str = "unet_r34_v1"):
     f16 = CKPT_DIR / "images_f16.npy"
     if not f16.exists():
         subprocess.check_call([sys.executable, "-u", str(ROOT / "src" / "build_f16_stack.py")])
-    row_of = {s: i for i, s in enumerate(train_stems())}
+    from src.data import train_stems as _ts
+    row_of = {s: i for i, s in enumerate(_ts())}
     print(f"f16 normalized stack: {f16.name} ({len(row_of)} stems)")
 
     by_key = load_annotations()
@@ -225,8 +222,8 @@ def main(fold: int = VAL_FOLD, epochs: int = EPOCHS, tag: str = "unet_r34_v1"):
     print(f"GT semantic RLE cache: {len(gt_sem)} sets")
     train_ds = FilamentCropDataset(train_items, row_of, gt_sem_rle=gt_sem,
                                    stack_path=f16)
-    val_ds = FilamentCropDataset(val_items, row_of, train_of=row_of, train=False,
-                                 gt_sem_rle=gt_sem, stack_path=f16)
+    val_ds = FilamentCropDataset(val_items, row_of, train=False, gt_sem_rle=gt_sem,
+                                 stack_path=f16)
     train_dl = DataLoader(train_ds, batch_size=BATCH, shuffle=True, drop_last=True,
                           num_workers=2, persistent_workers=True, prefetch_factor=4)
     val_dl = DataLoader(val_ds, batch_size=BATCH, shuffle=False, num_workers=0)
